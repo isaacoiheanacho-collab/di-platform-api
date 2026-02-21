@@ -6,6 +6,9 @@ const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const authRoutes = require('./src/routes/authRoutes');
 
+// Import database pool
+const { query } = require('./src/config/db');
+
 const app = express();
 const server = http.createServer(app);
 
@@ -22,12 +25,14 @@ const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    // Increase ping timeout to reduce disconnections on slow networks
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
 
 /**
  * SOCKET MIDDLEWARE: GATEKEEPER
- * Fixes the "undefined" User ID issue by correctly mapping the JWT payload.
  */
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
@@ -42,8 +47,6 @@ io.use((socket, next) => {
             return next(new Error("Authentication error"));
         }
         
-        // CRITICAL FIX: Ensure we map userId (from your authController.js JWT sign) 
-        // to socket.user so the logs work correctly.
         socket.user = {
             id: decoded.userId, 
             phoneNumber: decoded.phoneNumber
@@ -53,10 +56,9 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-    // Now socket.user.id will show up correctly in your terminal
     console.log(`📡 Device Verified: ${socket.id} (User ID: ${socket.user.id})`);
 
-    // Join personal room for direct messages/calls (NEW)
+    // Join personal room for direct messages/calls
     socket.join(`user:${socket.user.id}`);
 
     // --- CHAT LOGIC ---
@@ -65,25 +67,50 @@ io.on('connection', (socket) => {
         console.log(`👤 User ${socket.user.id} joined Chat Circle: ${circleId}`);
     });
 
-    socket.on('send_message', (data) => {
-        // SECURITY: We use socket.user.id from the token, NOT the ID sent in the payload
-        // to prevent users from spoofing other responders' identities.
+    // Request chat history for a circle
+    socket.on('request_history', async (circleId) => {
+        try {
+            const result = await query(
+                'SELECT * FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
+                [circleId]
+            );
+            // Send history in chronological order
+            const history = result.rows.reverse();
+            socket.emit('history', history);
+        } catch (err) {
+            console.error('Error fetching message history:', err);
+        }
+    });
+
+    // Handle new message
+    socket.on('send_message', async (data) => {
+        // SECURITY: Overwrite sender ID with verified user from token
         const enrichedMessage = {
             ...data,
             user: {
                 ...data.user,
-                _id: socket.user.id // Overwrite with verified ID
+                _id: socket.user.id
             },
             createdAt: new Date(),
         };
 
         console.log(`📩 [Circle ${data.circleId}] Message from Verified ID ${socket.user.id}`);
-        
-        // Broadcast to specific room only
+
+        // Save to database
+        try {
+            await query(
+                'INSERT INTO di_messages (circle_id, user_id, text, created_at) VALUES ($1, $2, $3, $4)',
+                [data.circleId, socket.user.id, data.text, enrichedMessage.createdAt]
+            );
+        } catch (err) {
+            console.error('Error saving message:', err);
+        }
+
+        // Broadcast to room
         socket.to(`circle_${data.circleId}`).emit('receive_message', enrichedMessage);
     });
 
-    // --- CALL SIGNALING (NEW) ---
+    // --- CALL SIGNALING ---
     socket.on('call_user', ({ targetUserId, offer }) => {
         console.log(`📞 Call from User ${socket.user.id} to User ${targetUserId}`);
         socket.to(`user:${targetUserId}`).emit('incoming_call', {
