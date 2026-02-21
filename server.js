@@ -70,8 +70,9 @@ io.on('connection', (socket) => {
     // Request chat history for a circle
     socket.on('request_history', async (circleId) => {
         try {
+            // Include sender_name in the query
             const result = await query(
-                'SELECT * FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
+                'SELECT id, user_id, text, created_at, sender_name FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
                 [circleId]
             );
             // Send history in chronological order
@@ -84,23 +85,35 @@ io.on('connection', (socket) => {
 
     // Handle new message
     socket.on('send_message', async (data) => {
-        // SECURITY: Overwrite sender ID with verified user from token
+        // Fetch sender's name from database
+        let senderName = 'User';
+        try {
+            const userResult = await query('SELECT full_name FROM di_users WHERE id = $1', [socket.user.id]);
+            if (userResult.rows.length > 0) {
+                senderName = userResult.rows[0].full_name || 'User';
+            }
+        } catch (err) {
+            console.error('Error fetching sender name:', err);
+        }
+
+        // Enrich message with verified sender ID and name
         const enrichedMessage = {
             ...data,
             user: {
                 ...data.user,
-                _id: socket.user.id
+                _id: socket.user.id,
+                name: senderName,
             },
             createdAt: new Date(),
         };
 
-        console.log(`📩 [Circle ${data.circleId}] Message from Verified ID ${socket.user.id}`);
+        console.log(`📩 [Circle ${data.circleId}] Message from Verified ID ${socket.user.id} (${senderName})`);
 
-        // Save to database
+        // Save to database including sender_name
         try {
             await query(
-                'INSERT INTO di_messages (circle_id, user_id, text, created_at) VALUES ($1, $2, $3, $4)',
-                [data.circleId, socket.user.id, data.text, enrichedMessage.createdAt]
+                'INSERT INTO di_messages (circle_id, user_id, text, created_at, sender_name) VALUES ($1, $2, $3, $4, $5)',
+                [data.circleId, socket.user.id, data.text, enrichedMessage.createdAt, senderName]
             );
         } catch (err) {
             console.error('Error saving message:', err);
