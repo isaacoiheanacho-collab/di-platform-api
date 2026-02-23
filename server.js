@@ -70,9 +70,9 @@ io.on('connection', (socket) => {
     // Request chat history for a circle
     socket.on('request_history', async (circleId) => {
         try {
-            // Include sender_name in the query
+            // Include reply_data in the query
             const result = await query(
-                'SELECT id, user_id, text, created_at, sender_name FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
+                'SELECT id, user_id, text, created_at, sender_name, reply_data FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
                 [circleId]
             );
             // Send history in chronological order
@@ -83,7 +83,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Handle new message
+    // Handle new message with status tracking
     socket.on('send_message', async (data) => {
         // Fetch sender's name from database
         let senderName = 'User';
@@ -109,18 +109,117 @@ io.on('connection', (socket) => {
 
         console.log(`📩 [Circle ${data.circleId}] Message from Verified ID ${socket.user.id} (${senderName})`);
 
-        // Save to database including sender_name
+        // Save to database including reply_data and get the message ID
+        let messageId;
         try {
-            await query(
-                'INSERT INTO di_messages (circle_id, user_id, text, created_at, sender_name) VALUES ($1, $2, $3, $4, $5)',
-                [data.circleId, socket.user.id, data.text, enrichedMessage.createdAt, senderName]
+            const insertResult = await query(
+                'INSERT INTO di_messages (circle_id, user_id, text, created_at, sender_name, reply_data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+                [
+                    data.circleId,
+                    socket.user.id,
+                    data.text,
+                    enrichedMessage.createdAt,
+                    senderName,
+                    data.replyTo ? JSON.stringify(data.replyTo) : null
+                ]
             );
+            messageId = insertResult.rows[0].id;
         } catch (err) {
             console.error('Error saving message:', err);
+            return;
+        }
+
+        // Fetch all members of this circle (excluding sender) to create status records
+        // For simplicity, we assume all users are in the same circle. Adjust as needed.
+        try {
+            const members = await query('SELECT id FROM di_users WHERE id != $1', [socket.user.id]);
+            for (const member of members.rows) {
+                await query(
+                    'INSERT INTO message_status (message_id, user_id, status) VALUES ($1, $2, $3)',
+                    [messageId, member.id, 'sent']
+                );
+            }
+        } catch (err) {
+            console.error('Error creating message statuses:', err);
         }
 
         // Broadcast to room
         socket.to(`circle_${data.circleId}`).emit('receive_message', enrichedMessage);
+    });
+
+    // Handle delivered notification
+    socket.on('delivered', async ({ messageId }) => {
+        // Update status for this recipient (the current user)
+        try {
+            await query(
+                'UPDATE message_status SET status = $1, updated_at = NOW() WHERE message_id = $2 AND user_id = $3',
+                ['delivered', messageId, socket.user.id]
+            );
+            // Get the sender of the message to notify them
+            const msg = await query('SELECT user_id FROM di_messages WHERE id = $1', [messageId]);
+            if (msg.rows.length > 0) {
+                const senderId = msg.rows[0].user_id;
+                socket.to(`user:${senderId}`).emit('status_update', { 
+                    messageId, 
+                    userId: socket.user.id, 
+                    status: 'delivered' 
+                });
+            }
+        } catch (err) {
+            console.error('Error updating delivery status:', err);
+        }
+    });
+
+    // --- NEW: Handle read receipt (per message) ---
+    socket.on('read', async ({ messageId }) => {
+        try {
+            await query(
+                'UPDATE message_status SET status = $1, updated_at = NOW() WHERE message_id = $2 AND user_id = $3',
+                ['read', messageId, socket.user.id]
+            );
+            const msg = await query('SELECT user_id FROM di_messages WHERE id = $1', [messageId]);
+            if (msg.rows.length > 0) {
+                const senderId = msg.rows[0].user_id;
+                socket.to(`user:${senderId}`).emit('status_update', { 
+                    messageId, 
+                    userId: socket.user.id, 
+                    status: 'read' 
+                });
+            }
+        } catch (err) {
+            console.error('Error updating read status:', err);
+        }
+    });
+
+    // --- NEW: Mark all messages as read when user opens chat ---
+    socket.on('mark_all_read', async ({ circleId }) => {
+        try {
+            // Find all messages in this circle where the current user is the recipient (not sender) and status is not 'read'
+            const messages = await query(
+                `SELECT m.id FROM di_messages m
+                 WHERE m.circle_id = $1 AND m.user_id != $2
+                 AND EXISTS (SELECT 1 FROM message_status ms WHERE ms.message_id = m.id AND ms.user_id = $2 AND ms.status != 'read')`,
+                [circleId, socket.user.id]
+            );
+            for (const row of messages.rows) {
+                await query(
+                    'UPDATE message_status SET status = $1, updated_at = NOW() WHERE message_id = $2 AND user_id = $3',
+                    ['read', row.id, socket.user.id]
+                );
+                // Notify sender
+                const msg = await query('SELECT user_id FROM di_messages WHERE id = $1', [row.id]);
+                if (msg.rows.length > 0) {
+                    const senderId = msg.rows[0].user_id;
+                    socket.to(`user:${senderId}`).emit('status_update', { 
+                        messageId: row.id, 
+                        userId: socket.user.id, 
+                        status: 'read' 
+                    });
+                }
+            }
+        } catch (err) {
+            console.error('Error marking all as read:', err);
+        }
     });
 
     // --- CALL SIGNALING ---
