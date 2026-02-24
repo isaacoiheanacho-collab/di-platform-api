@@ -222,6 +222,32 @@ io.on('connection', (socket) => {
         }
     });
 
+    // --- NEW: Handle message deletion ---
+    socket.on('delete_message', async ({ messageId }) => {
+        try {
+            // Check if the user is the sender (optional security)
+            const msgCheck = await query('SELECT user_id FROM di_messages WHERE id = $1', [messageId]);
+            if (msgCheck.rows.length === 0) return;
+            if (msgCheck.rows[0].user_id !== socket.user.id) {
+                console.log(`⚠️ User ${socket.user.id} tried to delete message ${messageId} but is not the sender`);
+                return;
+            }
+            // Delete from message_status (should cascade, but we'll delete explicitly)
+            await query('DELETE FROM message_status WHERE message_id = $1', [messageId]);
+            // Delete the message
+            await query('DELETE FROM di_messages WHERE id = $1', [messageId]);
+            // Notify all participants that this message was deleted
+            // Retrieve the circle_id to broadcast to the correct room
+            const circleResult = await query('SELECT circle_id FROM di_messages WHERE id = $1', [messageId]);
+            if (circleResult.rows.length > 0) {
+                const circleId = circleResult.rows[0].circle_id;
+                socket.to(`circle_${circleId}`).emit('message_deleted', messageId);
+            }
+        } catch (err) {
+            console.error('Error deleting message:', err);
+        }
+    });
+
     // --- CALL SIGNALING ---
     socket.on('call_user', ({ targetUserId, offer }) => {
         console.log(`📞 Call from User ${socket.user.id} to User ${targetUserId}`);
