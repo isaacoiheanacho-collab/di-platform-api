@@ -96,12 +96,12 @@ io.on('connection', (socket) => {
             console.error('Error fetching sender name:', err);
         }
 
-        // Enrich message with verified sender ID and name
+        // Enrich message with verified sender ID and name (ensure ID is string)
         const enrichedMessage = {
             ...data,
             user: {
                 ...data.user,
-                _id: socket.user.id,
+                _id: socket.user.id.toString(), // FIX: convert to string for alignment
                 name: senderName,
             },
             createdAt: new Date(),
@@ -222,27 +222,23 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- NEW: Handle message deletion ---
+    // --- NEW: Handle message deletion (corrected) ---
     socket.on('delete_message', async ({ messageId }) => {
         try {
-            // Check if the user is the sender (optional security)
-            const msgCheck = await query('SELECT user_id FROM di_messages WHERE id = $1', [messageId]);
+            // Check if the user is the sender and get circle_id
+            const msgCheck = await query('SELECT user_id, circle_id FROM di_messages WHERE id = $1', [messageId]);
             if (msgCheck.rows.length === 0) return;
             if (msgCheck.rows[0].user_id !== socket.user.id) {
                 console.log(`⚠️ User ${socket.user.id} tried to delete message ${messageId} but is not the sender`);
                 return;
             }
-            // Delete from message_status (should cascade, but we'll delete explicitly)
+            const circleId = msgCheck.rows[0].circle_id;
+            // Delete from message_status
             await query('DELETE FROM message_status WHERE message_id = $1', [messageId]);
             // Delete the message
             await query('DELETE FROM di_messages WHERE id = $1', [messageId]);
-            // Notify all participants that this message was deleted
-            // Retrieve the circle_id to broadcast to the correct room
-            const circleResult = await query('SELECT circle_id FROM di_messages WHERE id = $1', [messageId]);
-            if (circleResult.rows.length > 0) {
-                const circleId = circleResult.rows[0].circle_id;
-                socket.to(`circle_${circleId}`).emit('message_deleted', messageId);
-            }
+            // Notify all participants
+            socket.to(`circle_${circleId}`).emit('message_deleted', messageId);
         } catch (err) {
             console.error('Error deleting message:', err);
         }
