@@ -26,7 +26,6 @@ const io = new Server(server, {
         origin: "*",
         methods: ["GET", "POST"]
     },
-    // Increase ping timeout to reduce disconnections on slow networks
     pingTimeout: 60000,
     pingInterval: 25000
 });
@@ -67,15 +66,12 @@ io.on('connection', (socket) => {
         console.log(`👤 User ${socket.user.id} joined Chat Circle: ${circleId}`);
     });
 
-    // Request chat history for a circle
     socket.on('request_history', async (circleId) => {
         try {
-            // Include reply_data in the query
             const result = await query(
                 'SELECT id, user_id, text, created_at, sender_name, reply_data FROM di_messages WHERE circle_id = $1 ORDER BY created_at DESC LIMIT 50',
                 [circleId]
             );
-            // Send history in chronological order
             const history = result.rows.reverse();
             socket.emit('history', history);
         } catch (err) {
@@ -83,9 +79,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Handle new message with status tracking
     socket.on('send_message', async (data) => {
-        // Fetch sender's name from database
         let senderName = 'User';
         try {
             const userResult = await query('SELECT full_name FROM di_users WHERE id = $1', [socket.user.id]);
@@ -96,12 +90,11 @@ io.on('connection', (socket) => {
             console.error('Error fetching sender name:', err);
         }
 
-        // Enrich message with verified sender ID and name (ensure ID is string)
         const enrichedMessage = {
             ...data,
             user: {
                 ...data.user,
-                _id: socket.user.id.toString(), // FIX: convert to string for alignment
+                _id: socket.user.id.toString(),
                 name: senderName,
             },
             createdAt: new Date(),
@@ -109,7 +102,6 @@ io.on('connection', (socket) => {
 
         console.log(`📩 [Circle ${data.circleId}] Message from Verified ID ${socket.user.id} (${senderName})`);
 
-        // Save to database including reply_data and get the message ID
         let messageId;
         try {
             const insertResult = await query(
@@ -129,8 +121,6 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Fetch all members of this circle (excluding sender) to create status records
-        // For simplicity, we assume all users are in the same circle. Adjust as needed.
         try {
             const members = await query('SELECT id FROM di_users WHERE id != $1', [socket.user.id]);
             for (const member of members.rows) {
@@ -143,19 +133,15 @@ io.on('connection', (socket) => {
             console.error('Error creating message statuses:', err);
         }
 
-        // Broadcast to room
         socket.to(`circle_${data.circleId}`).emit('receive_message', enrichedMessage);
     });
 
-    // Handle delivered notification
     socket.on('delivered', async ({ messageId }) => {
-        // Update status for this recipient (the current user)
         try {
             await query(
                 'UPDATE message_status SET status = $1, updated_at = NOW() WHERE message_id = $2 AND user_id = $3',
                 ['delivered', messageId, socket.user.id]
             );
-            // Get the sender of the message to notify them
             const msg = await query('SELECT user_id FROM di_messages WHERE id = $1', [messageId]);
             if (msg.rows.length > 0) {
                 const senderId = msg.rows[0].user_id;
@@ -170,7 +156,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- NEW: Handle read receipt (per message) ---
     socket.on('read', async ({ messageId }) => {
         try {
             await query(
@@ -191,10 +176,8 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- NEW: Mark all messages as read when user opens chat ---
     socket.on('mark_all_read', async ({ circleId }) => {
         try {
-            // Find all messages in this circle where the current user is the recipient (not sender) and status is not 'read'
             const messages = await query(
                 `SELECT m.id FROM di_messages m
                  WHERE m.circle_id = $1 AND m.user_id != $2
@@ -206,7 +189,6 @@ io.on('connection', (socket) => {
                     'UPDATE message_status SET status = $1, updated_at = NOW() WHERE message_id = $2 AND user_id = $3',
                     ['read', row.id, socket.user.id]
                 );
-                // Notify sender
                 const msg = await query('SELECT user_id FROM di_messages WHERE id = $1', [row.id]);
                 if (msg.rows.length > 0) {
                     const senderId = msg.rows[0].user_id;
@@ -222,10 +204,8 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- NEW: Handle message deletion (corrected) ---
     socket.on('delete_message', async ({ messageId }) => {
         try {
-            // Check if the user is the sender and get circle_id
             const msgCheck = await query('SELECT user_id, circle_id FROM di_messages WHERE id = $1', [messageId]);
             if (msgCheck.rows.length === 0) return;
             if (msgCheck.rows[0].user_id !== socket.user.id) {
@@ -233,11 +213,8 @@ io.on('connection', (socket) => {
                 return;
             }
             const circleId = msgCheck.rows[0].circle_id;
-            // Delete from message_status
             await query('DELETE FROM message_status WHERE message_id = $1', [messageId]);
-            // Delete the message
             await query('DELETE FROM di_messages WHERE id = $1', [messageId]);
-            // Notify all participants
             socket.to(`circle_${circleId}`).emit('message_deleted', messageId);
         } catch (err) {
             console.error('Error deleting message:', err);
@@ -246,7 +223,7 @@ io.on('connection', (socket) => {
 
     // --- CALL SIGNALING ---
     socket.on('call_user', ({ targetUserId, offer }) => {
-        console.log(`📞 Call from User ${socket.user.id} to User ${targetUserId}`);
+        console.log(`📞 Call from User ${socket.user.id} → User ${targetUserId}`);
         socket.to(`user:${targetUserId}`).emit('incoming_call', {
             from: socket.user.id,
             offer
@@ -254,16 +231,27 @@ io.on('connection', (socket) => {
     });
 
     socket.on('answer_call', ({ target, answer }) => {
-        console.log(`📞 Call answered from User ${socket.user.id} to User ${target}`);
+        console.log(`📞 Call answered by User ${socket.user.id} → User ${target}`);
         socket.to(`user:${target}`).emit('call_answered', { answer });
     });
 
+    // ⭐ UPDATED ICE HANDLER WITH LOGGING + ROOM CHECK
     socket.on('ice_candidate', ({ target, candidate }) => {
-        socket.to(`user:${target}`).emit('ice_candidate', { candidate });
+        const room = `user:${target}`;
+        const socketsInRoom = io.sockets.adapter.rooms.get(room);
+
+        console.log(`❄️ ICE from User ${socket.user.id} → User ${target}`);
+
+        if (!socketsInRoom) {
+            console.log(`⚠️ ICE target room not found: ${room}`);
+            return;
+        }
+
+        socket.to(room).emit('ice_candidate', { candidate });
     });
 
     socket.on('decline_call', ({ target }) => {
-        console.log(`📞 Call declined from User ${socket.user.id} to User ${target}`);
+        console.log(`📞 Call declined by User ${socket.user.id} → User ${target}`);
         socket.to(`user:${target}`).emit('call_declined');
     });
 
