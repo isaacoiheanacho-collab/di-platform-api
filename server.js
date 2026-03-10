@@ -255,6 +255,12 @@ io.on('connection', (socket) => {
         socket.to(`user:${target}`).emit('call_declined');
     });
 
+    // ⭐ NEW: end_call handler
+    socket.on('end_call', ({ target }) => {
+        console.log(`📞 Call ended by User ${socket.user.id} → User ${target}`);
+        socket.to(`user:${target}`).emit('call_ended');
+    });
+
     socket.on('disconnect', () => {
         if (socket.user) {
             console.log(`🔌 User ${socket.user.id} Disconnected`);
